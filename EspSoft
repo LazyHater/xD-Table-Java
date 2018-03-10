@@ -1,0 +1,286 @@
+/*
+    Created on: 20.04.2017
+        Author: Wakabajaszi
+    Soft ver. 1.0
+*/
+
+
+
+#include <ESP8266WiFi.h>
+#include <WiFiUdp.h>
+#include <Adafruit_NeoPixel.h>
+
+//Analog pin connected to sensors
+const byte sensorsPin = A0;
+//Pin connected to built in led
+const byte ledPin = D4;
+//Pin connected to DATA_IN of pixels
+const byte pixelsPin = D8;
+//Nmber of pixels
+const byte pixelsNumb = 100;
+//Pin connected to ST_CP of 74HC595
+const byte latchPin = D2;
+//Pin connected to SH_CP of 74HC595
+const byte clockPin = D1;
+////Pin connected to DS of 74HC595
+const byte dataPin = D0;
+
+const char* ssid = "*****"
+const char* password = "****"
+
+Adafruit_NeoPixel strip = Adafruit_NeoPixel(pixelsNumb, pixelsPin, NEO_GRB + NEO_KHZ800);
+
+WiFiUDP Udp;
+unsigned int localUdpPort = 6660;  // local port to listen on
+uint8_t incomingPacket[400];  // buffer for incoming packet
+const byte reshuffle_tab[100] = {
+  0,  1,  2,  3,  4,   25, 26, 27, 28, 29,
+  5,  6,  7,  8,  9,   30, 31, 32, 33, 34,
+  10, 11, 12, 13, 14,  35, 36, 37, 38, 39,
+  15, 16, 17, 18, 19,  40, 41, 42, 43, 44,
+  20, 21, 22, 23, 24,  45, 46, 47, 48, 49,
+
+  50, 51, 52, 53, 54,  75, 76, 77, 78, 79,
+  55, 56, 57, 58, 59,  80, 81, 82, 83, 84,
+  60, 61, 62, 63, 64,  85, 86, 87, 88, 89,
+  65, 66, 67, 68, 69,  90, 91, 92, 93, 94,
+  70, 71, 72, 73, 74,  95, 96, 97, 98, 99,
+};
+enum PACKET_TYPE {
+  PING = 0,
+  PONG = 1,
+  SET_MATRIX = 2,
+  GET_TOUCHSCREEN = 3,
+  GET_TOUCHSCREEN_RAW = 4,
+  TOUCHSCREEN = 5,
+  TOUCHSCREEN_RAW = 6,
+  CALIBRATE = 7,
+  RESET = 8,
+  PANIC = 0x45
+};
+
+class IrPanel {
+  public:
+    IrPanel(byte latchPin, byte clockPin, byte dataPin, byte sensorsPin, byte threshold) :
+      latchPin(latchPin), clockPin(clockPin), dataPin(dataPin), sensorsPin(sensorsPin), threshold(threshold) {
+      pinMode(latchPin, OUTPUT);
+      pinMode(clockPin, OUTPUT);
+      pinMode(dataPin, OUTPUT);
+      pinMode(sensorsPin, INPUT);
+    };
+
+    void collectData() {
+      for (uint8_t j = 0; j < 4; j++) {
+        set(j << 5);
+        delayMicroseconds(200); //needed?
+        for (uint8_t i = 0; i < 25; i++) {
+          set(i + (j << 5));
+          if (!(i % 8)) delayMicroseconds(200);
+          readings[iRReshuffle[i + 25 * j]] = analogRead(sensorsPin) / 4;
+        }
+      }
+      set(1 << 7); //turn off IR
+    }
+
+    uint8_t getThrreshold() {
+      return threshold;
+    }
+
+    void setThrreshold(uint8_t threshold) {
+      this->threshold = threshold;
+    }
+
+    uint8_t* getRaw() {
+      return readings;
+    }
+
+    //TO DO: change to memset
+    //        bitshift instead of divide
+    void createRefferenceTable(uint8_t howManyAverages) { // averages readings and stores it in array
+      for (uint8_t i = 0; i < 100; i++) // fill reference table with zeros
+        refferenceTable[i] = 0;
+
+      for (uint8_t j = 0; j < howManyAverages; j++) { // sum iterations
+        collectData();
+        for (uint8_t i = 0; i < 100; i++)
+          refferenceTable[i] += readings[i];
+      }
+
+      for (uint8_t i = 0; i < 100; i++) // divade all by number of additions
+        refferenceTable[i] /= howManyAverages;
+    }
+
+    void convertReadingsToBoll() {
+      for (uint8_t i = 0; i < 100; i++) {
+        if (abs(readings[i] - refferenceTable[i]) >= threshold) {
+          readings[i] = 255;
+        } else {
+          readings[i] = 0;
+        }
+      }
+    }
+
+  private:
+    uint8_t latchPin;
+    uint8_t clockPin;
+    uint8_t dataPin;
+    uint8_t sensorsPin;
+    uint8_t threshold;
+
+    uint8_t  readings[100] = {0};
+    uint16_t  refferenceTable[100] = {0};
+
+    const uint8_t iRReshuffle[100] = {
+      0,  1,  2,  3,  4,
+      10, 11, 12, 13, 14,
+      20, 21, 22, 23, 24,
+      30, 31, 32, 33, 34,
+      40, 41, 42, 43, 44,
+
+      5,  6,  7,  8,  9,
+      15, 16, 17, 18, 19,
+      25, 26, 27, 28, 29,
+      35, 36, 37, 38, 39,
+      45, 46, 47, 48, 49,
+
+      50, 51, 52, 53, 54,
+      60, 61, 62, 63, 64,
+      70, 71, 72, 73, 74,
+      80, 81, 82, 83, 84,
+      90, 91, 92, 93, 94,
+
+      55, 56, 57, 58, 59,
+      65, 66, 67, 68, 69,
+      75, 76, 77, 78, 79,
+      85, 86, 87, 88, 89,
+      95, 96, 97, 98, 99,
+    };
+
+    void set(uint8_t p) {
+      digitalWrite(latchPin, LOW);
+      // shift out the bits:
+      shiftOut(dataPin, clockPin, MSBFIRST, p);
+      //take the latch pin high so the LEDs will light up:
+      digitalWrite(latchPin, HIGH);
+    }
+
+};
+
+IrPanel irPanel(latchPin, clockPin, dataPin, sensorsPin, 4);
+
+void setup() {
+  pinMode(ledPin, OUTPUT);
+  pinMode(pixelsPin, OUTPUT);
+
+  strip.begin();
+  strip.show(); // Initialize all pixels to 'off'
+
+  Serial.begin(115200);
+  Serial.printf("Connecting to %s ", ssid);
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED)
+  {
+    toogle();
+    delay(250);
+    toogle();
+    Serial.print(".");
+    delay(250);
+  }
+  Serial.println("connected");
+
+  Udp.begin(localUdpPort);
+  Serial.printf("Now listening at IP %s, UDP port %d\n", WiFi.localIP().toString().c_str(), localUdpPort);
+}
+
+void toogle() {
+  static bool state = false;
+  state = !state;
+  if (state) {
+    digitalWrite(ledPin, HIGH);
+  } else {
+    digitalWrite(ledPin, LOW);
+  }
+}
+
+long lastPacketTime = 0;
+#define CONNECTION_TIMEOUT_TIME 5000
+bool connection = false;
+
+void loop() {
+  yield(); //give some time to esp networking part
+
+  if ((connection) && (millis() - lastPacketTime > CONNECTION_TIMEOUT_TIME)) {
+    Serial.println("Lost connection with server.");
+    connection = false;
+  }
+  static long blinkTime = 0;
+  if ((!connection) && (millis() - blinkTime > 500)) {
+    toogle();
+    blinkTime = millis();
+  }
+
+  int packetSize = Udp.parsePacket();
+  if (packetSize)
+  {
+    if (!connection) {
+      Serial.println("Got connection with server.");
+      digitalWrite(ledPin, HIGH);
+      connection = true;
+    }
+    Serial.printf("Time from last packet: %d\n",millis() - lastPacketTime);
+    lastPacketTime = millis();
+    int len = Udp.read(incomingPacket, 400);
+
+    switch (incomingPacket[0]) {
+      case CALIBRATE: {
+          Serial.printf("Got CALIBRATE %d packet\n", incomingPacket[1]);
+          irPanel.createRefferenceTable(incomingPacket[1]);
+        }
+        break;
+
+      case PING: {
+          Serial.println("Got PING packet type.");
+          Udp.beginPacket(Udp.remoteIP(), Udp.remotePort());
+          Udp.write(PONG);
+          Udp.endPacket();
+        }
+        break;
+
+      case SET_MATRIX: {
+          byte* tmp = &(incomingPacket[2]);
+          for (int i = 0; i < incomingPacket[1]; i++) {
+            strip.setPixelColor(reshuffle_tab[i], strip.Color(tmp[i * 3], tmp[i * 3 + 1], tmp[i * 3 + 2]));
+          }
+          strip.show();
+        }
+        break;
+      case GET_TOUCHSCREEN: {
+          Serial.printf("usu, %d\n", millis());
+          irPanel.collectData();
+          irPanel.convertReadingsToBoll();
+          Udp.beginPacket(Udp.remoteIP(), Udp.remotePort());
+          Udp.write((byte)TOUCHSCREEN);
+          Udp.write(irPanel.getRaw(), 100);
+          Udp.endPacket();
+        }
+        break;
+      case GET_TOUCHSCREEN_RAW: {
+          Serial.printf("raw, %d\n", millis());
+          irPanel.collectData();
+          Udp.beginPacket(Udp.remoteIP(), Udp.remotePort());
+          Udp.write((byte)TOUCHSCREEN_RAW);
+          Udp.write(irPanel.getRaw(), 100);
+          Udp.endPacket();
+        }
+        break;
+      case RESET: {
+          Serial.println("Got RESET packet type, restarting...");
+          ESP.reset();
+        }
+        break;
+      default:
+        Serial.println("Unimplemented packet type.");
+        break;
+    }
+  }
+}
